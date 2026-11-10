@@ -1,0 +1,12 @@
+build/
+out/
+.vs/
+*.user
+*.dll
+*.exe
+*.pdb
+*.log
+tools/zwift_modules.txt
+
+# Developer notes (local only - DEV_NOTES.md is gitignored; the public README.md is the user guide)
+DEV_NOTES.md
