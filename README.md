@@ -23,13 +23,10 @@ riders nearby, turn choices) floats on panels around your handlebars.
 ## What you need
 
 - **Windows 10 or 11 (64-bit)** and the Zwift app for Windows.
-- **An NVIDIA graphics card**, and Zwift must run on it. On a laptop: Windows Settings > System > Display >
-  Graphics, add `ZwiftApp.exe` and choose **High performance**.
+- **An NVIDIA graphics card.**
 - **A PC VR headset:**
   - **Meta Quest 3 (recommended)** or Quest 2, with the **Meta Horizon Link** app on your PC (cable or Air Link).
-    Once, in Meta Horizon Link: Settings > General > next to OpenXR Runtime, select **Set Meta Horizon Link as
-    active** (if it's greyed out, it's already set).
-  - **Pimax** headsets with Pimax Play, set as the OpenXR runtime.
+  - **Pimax** headsets with Pimax Play.
   - Other headsets (SteamVR, Virtual Desktop) may work but haven't been tested.
 
 Nothing else needs to be installed.
@@ -38,24 +35,25 @@ Nothing else needs to be installed.
 
 1. Download the latest zip from the [Releases page](https://github.com/PeloTom89/vr-mod-for-zwift/releases) and
    unzip it anywhere, for example `C:\vr-mod-for-zwift`. Keep the files together.
-2. If Windows blocked the download: right-click `zvr_loader.exe` and `zwift_vr.dll` > Properties > tick
-   **Unblock** > OK. Your antivirus may warn about `zvr_loader.exe`, because it loads the mod into Zwift while Zwift
-   runs.
-3. **Recommended:** VR graphics settings for Zwift. They turn off effects that cost performance or look wrong in a
-   headset (shadows, bloom, speed blur and so on). Close Zwift, open PowerShell **as administrator** and run:
+2. Close Zwift, then double-click `zvr_loader.exe`.
+   - The first time, Windows may say **"Windows protected your PC"**: click **More info**, then **Run anyway**.
+     Your antivirus may also warn about it, because it loads the mod into Zwift while Zwift runs.
+   - Click **Yes** when Windows asks for administrator rights.
 
-   ```
-   powershell -ExecutionPolicy Bypass -File C:\vr-mod-for-zwift\tools\apply_zwift_perf_profile.ps1
-   ```
+The loader sets everything up by itself and shows what it did:
 
-   Run it again after a Zwift update. To undo it, run the same command with `-Restore` at the end.
+- **VR graphics settings** for Zwift: effects that cost performance or look wrong in a headset (shadows, bloom,
+  speed blur and so on) are turned off. Zwift's own settings are kept, and the VR ones go back in after a Zwift
+  update.
+- **Graphics card:** on laptops, Zwift is set to run on the NVIDIA card.
+- **Headset:** which headset software is active. If it says something needs attention, follow what it says.
 
 ## Ride
 
 1. Turn on your headset and start **Meta Horizon Link** (or Pimax Play) **before** Zwift. On the Quest, connect to
    your PC with Link or Air Link.
-2. Double-click `zvr_loader.exe` and accept the administrator prompt. Leave its window open: it loads the mod every
-   time Zwift starts.
+2. Double-click `zvr_loader.exe` and click **Yes**. Leave its window open: it loads the mod every time Zwift
+   starts.
 3. Start Zwift as usual and put your headset on.
    - In Zwift's menus you see Zwift on a virtual screen.
    - When your ride starts, you're in the world. On your PC monitor, Zwift's window grows bigger than the screen
@@ -81,6 +79,8 @@ Zwift. The file explains every setting; these are the ones you're most likely to
 | Setting | What it does |
 |---|---|
 | `world_scale` | 1.0 = life size. Raise it if the world feels too small, lower it if it feels too big. |
+| `steady_camera` | Smooths out Zwift's camera shake on bridges, cobbles and gravel (default 0.1). Higher = steadier, 0 = off. |
+| `vr_graphics` | 0 = keep Zwift's own graphics settings instead of the VR ones. |
 | `spread` | How far from the centre the info panels sit (default 1.3). |
 | `enabled` under `[hud]` | 0 = keep Zwift's info on the picture instead of on floating panels. |
 | `distance`, `width` under `[screen]` | Distance and size of the virtual screen in the menus, in metres. |
@@ -89,8 +89,9 @@ Zwift. The file explains every setting; these are the ones you're most likely to
 
 ## Tips and troubleshooting
 
-- **The headset shows nothing from Zwift:** start Meta Horizon Link (or Pimax Play) first, check the OpenXR runtime
-  setting above, then restart Zwift. The loader can stay open.
+- **The headset shows nothing from Zwift:** start Meta Horizon Link (or Pimax Play) first, then restart Zwift. The
+  loader can stay open. If the loader says the headset software isn't Meta Horizon Link: in Meta Horizon Link,
+  Settings > General > next to OpenXR Runtime, select **Set Meta Horizon Link as active**.
 - **Meta Horizon Link says "incompatible GPU" after an NVIDIA driver update:** some driver versions break it (621.14
   did; 591.86 works). Go back to the older driver.
 - **Use 72 or 90 Hz on the headset.** At 120 Hz, a laptop couldn't send frames to the headset fast enough, which
@@ -100,13 +101,13 @@ Zwift. The file explains every setting; these are the ones you're most likely to
 
 ## Uninstall
 
-Close `zvr_loader.exe` (Zwift runs normally without it), undo the graphics settings with `-Restore` (see Install),
-then delete the folder.
+Close `zvr_loader.exe` (Zwift runs normally without it), double-click `Restore Zwift graphics.cmd` to put Zwift's
+own graphics settings back, then delete the folder.
 
 ## Building from source
 
 You need Visual Studio 2026 Build Tools with "Desktop development with C++" (including the C++ CMake tools) and Git.
-Run `build.cmd`; the loader, the mod and the settings file end up in `build\Release`.
+Run `build.cmd`; the loader, the mod, the settings file and `Restore Zwift graphics.cmd` end up in `build\Release`.
 
 ## License
 

@@ -180,6 +180,29 @@ unsigned g_nW2V = 0, g_nProj = 0, g_nWVP = 0, g_nL2W = 0, g_nRefl = 0, g_frames 
 unsigned g_nW2VOther = 0, g_nWVPOther = 0;  // uniform uploads of other cameras (shadow/spotlight) left alone
 ULONGLONG g_statsSince = 0;
 
+// HUD phase (CamEnterHudPhase until the swap): every camera upload and new B_Scene slice is the HUD's own 3D render
+// (jersey icons) and stays on Zwift's camera. Counted to show it happens: perspective PROJ, other W2V/WVP, slices.
+bool g_hudPhase = false;
+unsigned g_nHudProj = 0, g_nHudOther = 0, g_nHudSlices = 0;
+
+// [vr] steady_camera (see Steady() below): Zwift's camera shake filtered out of the camera each frame renders from.
+float g_steadyTau = 0.1f;     // filter time constant, seconds; 0 = off
+float g_H0[16], g_H0inv[16];  // this frame's head-only transform, latched at swap; g_cur.H = g_H0 * S once V is seen
+bool g_steadyFrame = false;   // S already applied for this frame
+float g_steadyV[16];          // the raw V it was computed from
+struct SteadyState {
+  bool have = false;
+  double c[3] = {}, v[3] = {};      // filtered camera position (world cm) and velocity (cm/s)
+  double q[4] = {1, 0, 0, 0};       // filtered camera->world rotation (w x y z)
+  double w[3] = {};                 // its angular velocity (world frame, rad/s)
+  double rawC[3] = {}, rawQ[4] = {1, 0, 0, 0};  // the previous frame's raw camera (velocities after a snap)
+  LARGE_INTEGER t{};
+};
+SteadyState g_st;
+unsigned g_stFrames = 0, g_stSnaps = 0, g_stEarly = 0, g_stMismatch = 0;  // stats, 10 s window
+double g_stPosSum = 0, g_stRotSum = 0;
+float g_stPosMax = 0, g_stRotMax = 0;
+
 // Shadow-cascade evidence: does Zwift's sun-cascade origin (B_Scene ShadowViewPos[0], +976 by the
 // captured struct layout) move while only the head moves? Range over each 10 s window, with the head-yaw
 // range for comparison.
@@ -398,8 +421,11 @@ void CamConfigure(const CamOptions& o) {
   g_parallax = o.parallax;
   g_recentre = o.recentrePosition;
   g_coherentMode = std::clamp(o.coherentMode, 0, 2);
+  g_steadyTau = std::clamp(o.steadyCamera, 0.0f, 0.5f);
   Log("camera: immersive mode %s at start (Ctrl+Shift+F10 toggles), %.1f world units per metre",
       g_enabled ? "ON" : "off", g_cmPerMetre);
+  Log("camera: steady_camera %.2f s (%s)", g_steadyTau,
+      g_steadyTau > 0.0f ? "Zwift's camera shake on bridges, cobbles and gravel filtered out" : "off: Zwift's camera as is");
   Log("camera: parallax %.2f (Ctrl+Shift+PageUp/PageDown +-0.25), recentre_position %s (Ctrl+Shift+F1 re-homes), "
       "coherent %s, verdict keys Ctrl+Shift+Home = MERGED / End = DOUBLED",
       g_parallax, g_recentre ? "on" : "off", CoherentName(g_coherentMode));
@@ -470,6 +496,173 @@ bool KeyEdge(int vk, bool mods, bool& was) {
   return edge;
 }
 
+// ---------------- [vr] steady_camera: Zwift's camera shake taken out ----------------
+// On bridges, cobbles and gravel Zwift shakes its chase camera. On a monitor that is road feel; in a headset the
+// whole world shakes around you, which is nauseating. The shake is fast jitter on top of the camera's smooth path,
+// so each frame Zwift's camera (position + orientation) goes through a tracking filter - alpha-beta: it follows
+// steady speed and steady turning with no lag, and passes ~1 Hz at 0.1 s - and the frame renders from the filtered
+// camera instead. That is one more transform in camera space, H' = H * S with S = Vs * V^-1 (Zwift's camera ->
+// the steadied one), so every patched path (B_Scene, g_W2V, g_WVP via C, g_L2W) picks it up at once. Jumps past
+// the prediction (> 1.5 m or 20 deg: camera cuts, view changes, teleports) and gaps (> 0.25 s) snap back to Zwift's.
+
+void QMul(const double* a, const double* b, double* o) {  // o = a * b, quaternions as (w x y z)
+  const double w = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
+  const double x = a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2];
+  const double y = a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1];
+  const double z = a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0];
+  o[0] = w, o[1] = x, o[2] = y, o[3] = z;
+}
+void QConj(const double* q, double* o) { o[0] = q[0], o[1] = -q[1], o[2] = -q[2], o[3] = -q[3]; }
+void QNorm(double* q) {
+  const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  for (int i = 0; i < 4; ++i) q[i] /= n;
+}
+void QExp(const double* r, double* q) {  // rotation vector (rad) -> unit quaternion
+  const double a = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+  const double s = a < 1e-12 ? 0.5 : std::sin(a * 0.5) / a;
+  q[0] = std::cos(a * 0.5), q[1] = r[0] * s, q[2] = r[1] * s, q[3] = r[2] * s;
+}
+void QLog(const double* q, double* r) {  // unit quaternion -> rotation vector, the short way round
+  const double sg = q[0] < 0 ? -1.0 : 1.0;
+  const double x = q[1] * sg, y = q[2] * sg, z = q[3] * sg, w = q[0] * sg;
+  const double s = std::sqrt(x * x + y * y + z * z);
+  const double k = s < 1e-12 ? 2.0 : 2.0 * std::atan2(s, w) / s;
+  r[0] = x * k, r[1] = y * k, r[2] = z * k;
+}
+// 3x3 rotation M(r,c) = m[r*3+c] <-> unit quaternion
+void QFromMat(const double* m, double* q) {
+  const double tr = m[0] + m[4] + m[8];
+  if (tr > 0) {
+    const double s = std::sqrt(tr + 1.0) * 2.0;
+    q[0] = 0.25 * s, q[1] = (m[7] - m[5]) / s, q[2] = (m[2] - m[6]) / s, q[3] = (m[3] - m[1]) / s;
+  } else if (m[0] > m[4] && m[0] > m[8]) {
+    const double s = std::sqrt(1.0 + m[0] - m[4] - m[8]) * 2.0;
+    q[0] = (m[7] - m[5]) / s, q[1] = 0.25 * s, q[2] = (m[1] + m[3]) / s, q[3] = (m[2] + m[6]) / s;
+  } else if (m[4] > m[8]) {
+    const double s = std::sqrt(1.0 + m[4] - m[0] - m[8]) * 2.0;
+    q[0] = (m[2] - m[6]) / s, q[1] = (m[1] + m[3]) / s, q[2] = 0.25 * s, q[3] = (m[5] + m[7]) / s;
+  } else {
+    const double s = std::sqrt(1.0 + m[8] - m[0] - m[4]) * 2.0;
+    q[0] = (m[3] - m[1]) / s, q[1] = (m[2] + m[6]) / s, q[2] = (m[5] + m[7]) / s, q[3] = 0.25 * s;
+  }
+  QNorm(q);
+}
+void QToMat(const double* q, double* m) {
+  const double w = q[0], x = q[1], y = q[2], z = q[3];
+  m[0] = 1 - 2 * (y * y + z * z), m[1] = 2 * (x * y - w * z), m[2] = 2 * (x * z + w * y);
+  m[3] = 2 * (x * y + w * z), m[4] = 1 - 2 * (x * x + z * z), m[5] = 2 * (y * z - w * x);
+  m[6] = 2 * (x * z - w * y), m[7] = 2 * (y * z + w * x), m[8] = 1 - 2 * (x * x + y * y);
+}
+double Len3(const double* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+
+// One filter step on this frame's raw camera: position c (world cm) and camera->world rotation Q.
+void SteadyStep(const double* c, const double* Q) {
+  LARGE_INTEGER now, freq;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&freq);
+  const double dt = g_st.have ? static_cast<double>(now.QuadPart - g_st.t.QuadPart) / freq.QuadPart : 0.0;
+  g_st.t = now;
+  constexpr double kJumpCm = 150.0, kJumpRad = 0.35, kGapS = 0.25;
+  bool snap = !g_st.have || dt <= 0.0 || dt > kGapS;
+  double pc[3], pq[4], e[3], r[3];
+  if (!snap) {  // predict with the tracked velocities, then compare with Zwift's camera
+    double dq[4], wdt[3] = {g_st.w[0] * dt, g_st.w[1] * dt, g_st.w[2] * dt}, qc[4], rq[4];
+    for (int i = 0; i < 3; ++i) pc[i] = g_st.c[i] + g_st.v[i] * dt, e[i] = c[i] - pc[i];
+    QExp(wdt, dq);
+    QMul(dq, g_st.q, pq);
+    QNorm(pq);
+    QConj(pq, qc);
+    QMul(Q, qc, rq);
+    QLog(rq, r);
+    snap = Len3(e) > kJumpCm || Len3(r) > kJumpRad;
+  }
+  if (snap) {
+    // Back on Zwift's camera. Start the velocities from its last step, unless that step was the jump itself.
+    double d[3] = {c[0] - g_st.rawC[0], c[1] - g_st.rawC[1], c[2] - g_st.rawC[2]}, qc[4], rq[4], rr[3];
+    QConj(g_st.rawQ, qc);
+    QMul(Q, qc, rq);
+    QLog(rq, rr);
+    const bool steps = g_st.have && dt > 0.0 && dt <= kGapS && Len3(d) < kJumpCm && Len3(rr) < kJumpRad;
+    for (int i = 0; i < 3; ++i) {
+      g_st.v[i] = steps ? d[i] / dt : 0.0;
+      g_st.w[i] = steps ? rr[i] / dt : 0.0;
+      g_st.c[i] = c[i];
+    }
+    memcpy(g_st.q, Q, sizeof(g_st.q));
+    if (g_st.have) g_stSnaps++;
+  } else {
+    const double a = 1.0 - std::exp(-dt / g_steadyTau), b = a * a / (2.0 - a);  // critically damped alpha-beta
+    double ar[3] = {r[0] * a, r[1] * a, r[2] * a}, dq[4];
+    for (int i = 0; i < 3; ++i) {
+      g_st.c[i] = pc[i] + a * e[i];
+      g_st.v[i] += b / dt * e[i];
+      g_st.w[i] += b / dt * r[i];
+    }
+    QExp(ar, dq);
+    QMul(dq, pq, g_st.q);
+    QNorm(g_st.q);
+  }
+  memcpy(g_st.rawC, c, sizeof(g_st.rawC));
+  memcpy(g_st.rawQ, Q, sizeof(g_st.rawQ));
+  g_st.have = true;
+}
+
+// First sighting of Zwift's main view V in a frame (B_Scene main slice or main g_W2V upload): filter, then render
+// this frame from the steadied camera. Later sightings in the same frame reuse it.
+void Steady(const float* V) {
+  if (g_steadyTau <= 0.0f || g_cur.eye < 0) return;
+  if (g_steadyFrame) {
+    if (!CloseRigid(V, g_steadyV, 1e-4f, 0.5f)) g_stMismatch++;
+    return;
+  }
+  g_steadyFrame = true;
+  memcpy(g_steadyV, V, sizeof(g_steadyV));
+
+  // Zwift's camera: camera->world rotation Rc (= R_V^T, Rc(r,c) = V[r*4+c]) and position c = -R_V^T t.
+  double Rc[9], c[3], Q[4];
+  for (int r = 0; r < 3; ++r)
+    for (int k = 0; k < 3; ++k) Rc[r * 3 + k] = V[r * 4 + k];
+  for (int i = 0; i < 3; ++i)
+    c[i] = -(static_cast<double>(V[i * 4 + 0]) * V[12] + static_cast<double>(V[i * 4 + 1]) * V[13] +
+             static_cast<double>(V[i * 4 + 2]) * V[14]);
+  QFromMat(Rc, Q);
+  SteadyStep(c, Q);
+
+  // S: Zwift's camera space -> the steadied camera's. Rotation Rs^T * Rc, translation Rs^T * (c - c_s).
+  double Rs[9], SR[9], St[3];
+  QToMat(g_st.q, Rs);
+  for (int r = 0; r < 3; ++r) {
+    St[r] = 0.0;
+    for (int k = 0; k < 3; ++k) {
+      SR[r * 3 + k] = Rs[0 * 3 + r] * Rc[0 * 3 + k] + Rs[1 * 3 + r] * Rc[1 * 3 + k] + Rs[2 * 3 + r] * Rc[2 * 3 + k];
+      St[r] += Rs[k * 3 + r] * (c[k] - g_st.c[k]);
+    }
+  }
+  float S[16] = {}, Sinv[16] = {};
+  for (int r = 0; r < 3; ++r) {
+    for (int k = 0; k < 3; ++k) {
+      S[k * 4 + r] = static_cast<float>(SR[r * 3 + k]);
+      Sinv[k * 4 + r] = static_cast<float>(SR[k * 3 + r]);
+    }
+    S[12 + r] = static_cast<float>(St[r]);
+    Sinv[12 + r] = static_cast<float>(-(SR[0 * 3 + r] * St[0] + SR[1 * 3 + r] * St[1] + SR[2 * 3 + r] * St[2]));
+  }
+  S[15] = Sinv[15] = 1.0f;
+  Mul(g_H0, S, g_cur.H);
+  Mul(Sinv, g_H0inv, g_cur.Hinv);
+  UpdateC();
+
+  // How much shake came out this frame: position offset and rotation angle between Zwift's camera and ours.
+  const double dp = std::sqrt(St[0] * St[0] + St[1] * St[1] + St[2] * St[2]);
+  const double ca = std::clamp((SR[0] + SR[4] + SR[8] - 1.0) * 0.5, -1.0, 1.0);
+  const double da = std::acos(ca) * 57.29578;
+  g_stFrames++;
+  g_stPosSum += dp;
+  g_stRotSum += da;
+  g_stPosMax = std::max(g_stPosMax, static_cast<float>(dp));
+  g_stRotMax = std::max(g_stRotMax, static_cast<float>(da));
+}
+
 }  // namespace
 
 void CamSetWindowAspect(float aspect) { g_windowAspect = aspect; }
@@ -483,6 +676,11 @@ void CamDisable() {  // plain stores only: called from the swap hook's SEH handl
   g_enabled = false;
   g_cur.eye = -1;
   g_camSkipReflDraws = false;
+  g_hudPhase = false;
+}
+
+void CamEnterHudPhase() {
+  if (g_cur.eye >= 0) g_hudPhase = true;
 }
 
 int CamCurrentEye(XrPosef* pose, XrFovf* fov) {
@@ -595,6 +793,8 @@ void CamOnSwap() {
           g_coherentActive ? "MOVING -> COHERENT (both eyes from each frame, no parallax)" : "STILL -> STEREO", s8, t8);
   }
   g_cur.eye = -1;
+  g_hudPhase = false;      // the next frame starts with its world pass
+  g_steadyFrame = false;   // ... and its camera is filtered when first seen
   g_sliceKind.clear();     // new frame: B_Scene slices are classified (and patched) once again
   g_camSkipReflDraws = false;
   g_patchedScene.clear();
@@ -659,6 +859,8 @@ void CamOnSwap() {
       PoseToMatrix(rp, g_cmPerMetre, E);
       memcpy(g_cur.Hinv, E, sizeof(E));
       Inverse(E, g_cur.H);
+      memcpy(g_H0, g_cur.H, sizeof(g_H0));  // head only; Steady() adds this frame's shake removal
+      memcpy(g_H0inv, g_cur.Hinv, sizeof(g_H0inv));
       g_cur.pose = sub;
       g_cur.fov = ef;
       g_cur.eye = eye;
@@ -716,6 +918,15 @@ void CamOnSwap() {
           g_nW2VOther, g_nWVPOther, g_haveSvp ? g_svpMax[0] - g_svpMin[0] : -1.0f,
           g_haveSvp ? g_svpMax[1] - g_svpMin[1] : -1.0f, g_haveSvp ? g_svpMax[2] - g_svpMin[2] : -1.0f,
           g_yawMax >= g_yawMin ? g_yawMax - g_yawMin : 0.0f);
+      Log("camera: HUD phase left on Zwift's camera: perspective PROJ %u, W2V/WVP %u, B_Scene slices %u "
+          "(the HUD's own 3D renders, e.g. jersey icons)",
+          g_nHudProj, g_nHudOther, g_nHudSlices);
+      if (g_steadyTau > 0.0f && g_stFrames)
+        Log("camera: steady_camera %.2f s: Zwift's camera shake taken out avg %.1f cm + %.2f deg per frame (max %.1f cm, "
+            "%.2f deg) over %u frames | %u snaps back to Zwift's camera (cuts, view changes) | %u uploads before the "
+            "frame's camera, %u V mismatches",
+            g_steadyTau, g_stPosSum / g_stFrames, g_stRotSum / g_stFrames, g_stPosMax, g_stRotMax, g_stFrames,
+            g_stSnaps, g_stEarly, g_stMismatch);
       if (g_camSteps) {
         const bool still = g_camStepSum / g_camSteps < 1.0 && g_camTurnSum / g_camSteps < 0.05;
         Log("camera: Zwift camera moved %.1f cm + turned %.3f deg per frame avg (max %.1f cm, %.3f deg), %u cuts, "
@@ -732,6 +943,10 @@ void CamOnSwap() {
     g_camStepMax = g_camTurnMax = 0;
     g_framesCoherent = 0;
     g_nW2VOther = g_nWVPOther = 0;
+    g_nHudProj = g_nHudOther = g_nHudSlices = 0;
+    g_stFrames = g_stSnaps = g_stEarly = g_stMismatch = 0;
+    g_stPosSum = g_stRotSum = 0;
+    g_stPosMax = g_stRotMax = 0;
     g_haveSvp = false;
     g_yawMin = 1e9f;
     g_yawMax = -1e9f;
@@ -758,6 +973,10 @@ void CamOnBindRange(GLenum target, GLuint index, GLuint buffer, ptrdiff_t offset
     }
     g_camSkipReflDraws = false;  // any other B_Scene bind ends a reflection pass
     g_sliceKind[offset] = kSliceOther;
+    if (g_hudPhase) {  // first bound after the world was composited: the HUD's own 3D render, Zwift's camera
+      g_nHudSlices++;
+      return;
+    }
     if (size < kSceneMin) return;
     float* base = CpuPtr(buffer, offset, kSceneMin);
     if (!base) return;
@@ -839,6 +1058,7 @@ void CamOnBindRange(GLenum target, GLuint index, GLuint buffer, ptrdiff_t offset
       if (const float* full = CpuPtr(buffer, offset, avail)) LocateSceneFields(full, avail, V, P);
     }
     if (!g_haveP0) return;  // P0 not invertible: nothing consistent to write
+    Steady(V);  // [vr] steady_camera: from here on g_cur.H/Hinv/C include this frame's shake removal
 
     float Vinv[16], V2[16], P2inv[16];
     Inverse(V, Vinv);
@@ -972,6 +1192,19 @@ bool CamOverrideUniform(GLint prog, GLint loc, const GLfloat* v, bool transpose,
   float m[16];
   if (transpose) Transpose(v, m); else memcpy(m, v, sizeof(m));
 
+  if (g_hudPhase) {
+    // After the world was composited only the HUD draws, and its 3D bits (the jersey icons in Zwifters Nearby) use
+    // perspective cameras of their own, some with the window's aspect. Left untouched - and kept out of P0/V
+    // tracking, which belongs to the world camera.
+    if (loc == pi.proj) {
+      pi.projPatched = false;
+      if (IsPerspective(m) && m[11] <= 0) g_nHudProj++;
+    } else if ((loc == pi.wvp && !IsAffine(m)) || (loc == pi.w2v && IsRigid(m))) {
+      g_nHudOther++;
+    }
+    return false;
+  }
+
   if (loc == pi.proj) {
     pi.projPatched = false;  // until this upload is actually replaced below
     if (!IsPerspective(m) || m[11] > 0) return false;  // not a camera projection (e.g. shadow/ortho)
@@ -1034,6 +1267,7 @@ bool CamOverrideUniform(GLint prog, GLint loc, const GLfloat* v, bool transpose,
       memcpy(g_V, m, sizeof(m));
       g_haveV = Inverse(g_V, g_Vinv);
     }
+    Steady(m);  // the frame's main camera (first sighting filters, later ones reuse it)
     Mul(g_cur.H, m, out);
     (loc == pi.refl ? g_nRefl : g_nW2V)++;
     return true;
@@ -1052,12 +1286,14 @@ bool CamOverrideUniform(GLint prog, GLint loc, const GLfloat* v, bool transpose,
       g_nWVPOther++;
       return false;
     }
+    if (g_steadyTau > 0.0f && !g_steadyFrame) g_stEarly++;  // patched before the frame's camera was seen
     Mul(g_cur.C, m, out);
     g_nWVP++;
     return true;
   }
   if (loc == pi.l2w) {
     if (!g_haveV || !CloseRigid(m, g_Vinv, 0.02f, 200.0f)) return false;  // a real model matrix
+    if (g_steadyTau > 0.0f && !g_steadyFrame) g_stEarly++;
     Mul(m, g_cur.Hinv, out);
     g_nL2W++;
     return true;

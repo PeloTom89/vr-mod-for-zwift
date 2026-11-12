@@ -81,6 +81,7 @@ DWORD WINAPI InitThread(void*) {
   co.parallax = cfg.parallax;
   co.recentrePosition = cfg.recentrePosition;
   co.coherentMode = cfg.coherentMode;
+  co.steadyCamera = cfg.steadyCamera;
   co.autoScreenInMenus = cfg.autoScreenInMenus;
   CamConfigure(co);
   VrWindowConfigure(cfg.bigWindowWidth, cfg.autoBigWindow);

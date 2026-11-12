@@ -26,6 +26,7 @@ struct CamOptions {
   int coherentMode = 0;           // COHERENT (both eyes from one frame): 0 never, 1 while Zwift's camera moves,
                                   // 2 always (ini only, no hotkey)
   bool autoScreenInMenus = true;  // virtual screen in Zwift's menus, immersive while riding (zwift_state.h)
+  float steadyCamera = 0.1f;      // seconds of filtering that takes Zwift's camera shake out (bridges, gravel); 0 = off
 };
 void CamConfigure(const CamOptions& o);
 
@@ -58,6 +59,12 @@ void CamSetWindowAspect(float aspect);
 // Render thread, from the SwapBuffers hook AFTER the frame was captured: polls the
 // Ctrl+Shift+F10 toggle and latches the eye pose/FOV for the NEXT Zwift frame.
 void CamOnSwap();
+
+// From the window-draw counter: Zwift's first HUD draw into the window (after [hud] composite_draws) starts the HUD
+// phase, which lasts until the swap. Camera uploads in it belong to the HUD's own small 3D renders (the jersey icons
+// in Zwifters Nearby are perspective renders) and stay on Zwift's camera - patched with the eye's, they were squashed
+// to a sliver.
+void CamEnterHudPhase();
 
 // Eye the current Zwift frame is being rendered for (-1 = no override this frame, 0/1 = that eye,
 // 2 = COHERENT: one image for both eyes), with its pose and the frustum actually RENDERED (symmetric in

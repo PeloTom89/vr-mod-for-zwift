@@ -18,6 +18,7 @@ struct Config {
   float parallax = 1.0f;        // eye-separation scale: 1 = your real IPD, 0 = no stereo (live: Ctrl+Shift+PgUp/PgDn)
   bool recentrePosition = true; // eye origin = where your head was at start / Ctrl+Shift+F1, not the runtime's origin
   int coherentMode = 2;       // both eyes from the newest frame: 0 never, 1 while Zwift's camera moves, 2 always
+  float steadyCamera = 0.1f;    // seconds of filtering that takes Zwift's camera shake out (bridges, gravel); 0 = off
   bool cropToEyeFov = true;     // submit only the part of each eye image the headset can show (Ctrl+Shift+Insert)
   int bigWindowWidth = 3840;    // Zwift window width for Ctrl+Shift+Delete (sharper eye images)
   bool autoBigWindow = true;    // big window automatically while riding, normal size in Zwift's menus
@@ -32,11 +33,19 @@ struct Config {
     float x0, y0, x1, y1;       // part of Zwift's window, 0..1, top-left origin
     float px, py, dist;         // card centre in metres from your head's home position: right, up, ahead
     float width;                // metres (height follows the rect's shape)
+    // cardN_wide: a bigger part of the window this card shows while a full-width banner is on screen (detected by
+    // Zwift drawing in the wide part left of the card's own); other cards overlapping it are cut off above it.
+    bool wide = false;
+    float wx0 = 0, wy0 = 0, wx1 = 0, wy1 = 0;
   };
   static constexpr int kMaxHudCards = 8;
   HudCard hudCards[kMaxHudCards] = {};
   int hudCardCount = 0;
   float hudSpread = 1.0f;       // every card's angle from straight ahead x this (live: Ctrl+Shift+[ / ])
+  // [hud] banner_probe: where a full-width banner is looked for (window fractions x0 y0 x1 y1); none = the
+  // cardN_wide part left of that card's own
+  bool haveBannerProbe = false;
+  float bannerProbe[4] = {};
 
   // [render]
   bool shadows = true;          // false: skip draws into shadow maps (no shadows, less CPU)

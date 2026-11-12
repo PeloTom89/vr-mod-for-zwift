@@ -56,6 +56,7 @@ Config LoadConfig() {
   c.recentrePosition = ReadFloat(ini.c_str(), L"vr", L"recentre_position", 1.0f) != 0.0f;
   c.coherentMode =
       std::clamp(static_cast<int>(ReadFloat(ini.c_str(), L"vr", L"coherent_when_moving", 2.0f) + 0.5f), 0, 2);
+  c.steadyCamera = std::clamp(ReadFloat(ini.c_str(), L"vr", L"steady_camera", c.steadyCamera), 0.0f, 0.5f);
   c.cropToEyeFov = ReadFloat(ini.c_str(), L"vr", L"crop_to_eye_fov", 1.0f) != 0.0f;
   c.bigWindowWidth = static_cast<int>(ReadFloat(ini.c_str(), L"vr", L"big_window_width", 3840.0f));
   c.autoScreenInMenus = ReadFloat(ini.c_str(), L"vr", L"auto_screen_in_menus", 1.0f) != 0.0f;
@@ -89,9 +90,43 @@ Config LoadConfig() {
     k.y0 = std::clamp(k.y0, 0.0f, 1.0f);
     k.x1 = std::clamp(k.x1, 0.0f, 1.0f);
     k.y1 = std::clamp(k.y1, 0.0f, 1.0f);
+    // "cardN_wide = x0 y0 x1 y1": only one card can have it (the first one wins); it must reach further left.
+    swprintf_s(key, L"card%d_wide", i);
+    GetPrivateProfileStringW(L"hud", key, L"", buf, 256, ini.c_str());
+    if (wchar_t* semi = wcschr(buf, L';')) *semi = 0;
+    bool anyWide = false;
+    for (int j = 0; j < c.hudCardCount; ++j) anyWide |= c.hudCards[j].wide;
+    float w[4] = {};
+    if (buf[0] && !anyWide) {
+      if (swscanf_s(buf, L"%f %f %f %f", &w[0], &w[1], &w[2], &w[3]) == 4 && w[2] > w[0] && w[3] > w[1] &&
+          w[0] < k.x0 - 0.02f) {
+        k.wide = true;
+        k.wx0 = std::clamp(w[0], 0.0f, 1.0f);
+        k.wy0 = std::clamp(w[1], 0.0f, 1.0f);
+        k.wx1 = std::clamp(w[2], 0.0f, 1.0f);
+        k.wy1 = std::clamp(w[3], 0.0f, 1.0f);
+      } else {
+        Log("config [hud]: %ls ignored - needs x0 y0 x1 y1, with x0 left of the card's own x0", key);
+      }
+    }
     c.hudCards[c.hudCardCount++] = k;
   }
   if (c.hudCardCount == 0) c.hudCards[c.hudCardCount++] = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, -0.1f, 1.0f, 1.2f};
+  {
+    wchar_t buf[256];
+    GetPrivateProfileStringW(L"hud", L"banner_probe", L"", buf, 256, ini.c_str());
+    if (wchar_t* semi = wcschr(buf, L';')) *semi = 0;
+    float* p = c.bannerProbe;
+    if (buf[0]) {
+      if (swscanf_s(buf, L"%f %f %f %f", &p[0], &p[1], &p[2], &p[3]) == 4 && p[2] > p[0] && p[3] > p[1]) {
+        for (int i = 0; i < 4; ++i) p[i] = std::clamp(p[i], 0.0f, 1.0f);
+        c.haveBannerProbe = true;
+        Log("config [hud]: banner_probe %.3f,%.3f-%.3f,%.3f", p[0], p[1], p[2], p[3]);
+      } else {
+        Log("config [hud]: banner_probe ignored - needs x0 y0 x1 y1");
+      }
+    }
+  }
   c.hudSpread = std::clamp(ReadFloat(ini.c_str(), L"hud", L"spread", 1.0f), 0.5f, 2.5f);
   Log("config [hud]: enabled=%d composite_draws=%d, %d card(s), spread %.2f", c.hud, c.hudCompositeDraws,
       c.hudCardCount, c.hudSpread);
@@ -99,6 +134,9 @@ Config LoadConfig() {
     const Config::HudCard& k = c.hudCards[i];
     Log("  card%d: window %.2f,%.2f-%.2f,%.2f -> %.2f m right, %.2f m up, %.2f m ahead, %.2f m wide", i + 1, k.x0, k.y0,
         k.x1, k.y1, k.px, k.py, k.dist, k.width);
+    if (k.wide)
+      Log("  card%d_wide: window %.2f,%.2f-%.2f,%.2f while a full-width banner is on screen", i + 1, k.wx0, k.wy0, k.wx1,
+          k.wy1);
   }
   Log("config %ls: distance=%.2f width=%.2f height=%.2f crop_aspect=%.3f | stereo=%d ipd_mm=%.1f strength=%.2f "
       "convergence=%.2f",

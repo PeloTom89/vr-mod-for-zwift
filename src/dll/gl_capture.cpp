@@ -3,6 +3,7 @@
 #include <GL/gl.h>
 #include <d3d11.h>
 
+#include <algorithm>
 #include <string>
 
 #include "camera.h"
@@ -386,6 +387,9 @@ void GlCaptureConfigureHud(bool on, int compositeDraws, bool useAlpha) {
 
 void GlCaptureOnWindowDraw() {
   const unsigned n = ++s.windowDraws;
+  // The scene composite (or, with composite_draws 0, the HUD's first draw) is being issued: the world is finished, and
+  // camera uploads from here to the swap belong to the HUD. HUD cards on or off.
+  if (n == static_cast<unsigned>(std::max(g_hudCompositeDraws, 1))) CamEnterHudPhase();
   if (n != static_cast<unsigned>(g_hudCompositeDraws) + 1 || s.worldValid) return;
   if (s.failed || !s.dxHudObj || !g_shared.hudOn.load() || !CamActive()) return;
   if (wglGetCurrentContext() != s.ctx) return;  // only Zwift's main context, the one we capture

@@ -427,10 +427,12 @@ struct Swapchain {
 // those pixels (3x3 max, so thin text and panel edges stay solid) and make the rest transparent. Translucent HUD
 // panels keep a dimmed copy of the world behind them, which reads as the panel's own background.
 const char kHudHlsl[] = R"(
-cbuffer P : register(b0) { uint W; uint H; float lo; float hi; uint useAlpha; uint3 pad; };
+cbuffer P : register(b0) { uint W; uint H; float lo; float hi; uint useAlpha; uint3 pad; uint4 probe; };
 Texture2D<float4> Final : register(t0);
 Texture2D<float4> World : register(t1);
 RWTexture2D<float4> Out : register(u0);
+RWBuffer<uint> Count : register(u1);  // [0] = solid HUD pixels inside `probe` (x0 y0 x1 y1, pixels)
+groupshared uint gCount;
 
 float Diff(int2 p) {
   p = clamp(p, int2(0, 0), int2((int)W - 1, (int)H - 1));
@@ -439,21 +441,29 @@ float Diff(int2 p) {
 }
 
 [numthreads(8, 8, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-  if (id.x >= W || id.y >= H) return;
-  float m = 0.0;
-  [unroll] for (int y = -1; y <= 1; ++y)
-    [unroll] for (int x = -1; x <= 1; ++x) m = max(m, Diff(int2(id.xy) + int2(x, y)));
-  float4 f = Final.Load(int3(id.xy, 0));
-  float d = saturate((m - lo) / (hi - lo));
-  if (useAlpha != 0 && f.a > 0.004) {
-    // The window's alpha was zeroed before the HUD, so f.a = HUD coverage and f.rgb = HUD over world:
-    // take the world back out -> the panel's own colour, no scenery moving inside it.
-    float3 w = World.Load(int3(id.xy, 0)).rgb;
-    Out[id.xy] = float4(saturate((f.rgb - (1.0 - f.a) * w) / f.a), f.a);
-  } else {
-    Out[id.xy] = float4(f.rgb, d);  // no coverage written here: fall back to the difference mask
+void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+  if (gi == 0) gCount = 0;
+  GroupMemoryBarrierWithGroupSync();
+  if (id.x < W && id.y < H) {
+    float m = 0.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+      [unroll] for (int x = -1; x <= 1; ++x) m = max(m, Diff(int2(id.xy) + int2(x, y)));
+    float4 f = Final.Load(int3(id.xy, 0));
+    float d = saturate((m - lo) / (hi - lo));
+    float4 o;
+    if (useAlpha != 0 && f.a > 0.004) {
+      // The window's alpha was zeroed before the HUD, so f.a = HUD coverage and f.rgb = HUD over world:
+      // take the world back out -> the panel's own colour, no scenery moving inside it.
+      float3 w = World.Load(int3(id.xy, 0)).rgb;
+      o = float4(saturate((f.rgb - (1.0 - f.a) * w) / f.a), f.a);
+    } else {
+      o = float4(f.rgb, d);  // no coverage written here: fall back to the difference mask
+    }
+    Out[id.xy] = o;
+    if (o.a > 0.5 && id.x >= probe.x && id.x < probe.z && id.y >= probe.y && id.y < probe.w) InterlockedAdd(gCount, 1u);
   }
+  GroupMemoryBarrierWithGroupSync();
+  if (gi == 0 && gCount != 0) InterlockedAdd(Count[0], gCount);
 }
 )";
 
@@ -461,8 +471,9 @@ struct HudParams {
   uint32_t W, H;
   float lo, hi;  // colour difference (0..1) below lo = transparent, above hi = opaque
   uint32_t useAlpha, pad[3];
+  uint32_t probe[4];  // pixels: x0 y0 x1 y1 counted into Count[0]
 };
-static_assert(sizeof(HudParams) == 32);
+static_assert(sizeof(HudParams) == 48);
 
 struct Hud {
   ID3D11ComputeShader* cs = nullptr;  // once per device
@@ -476,6 +487,20 @@ struct Hud {
   bool have = false;                  // `out` holds a HUD image
   uint64_t updates = 0, copied = 0;   // HUD images made / last one copied into the HUD swapchain
   unsigned updatesInWindow = 0;
+  // [hud] cardN_wide: how much of the probe (the wide part left of that card's own) Zwift's HUD covers. Counted
+  // on the GPU, read back a couple of frames later without waiting (ring of staging buffers).
+  float probeFrac[4] = {};             // window fractions; empty = no probe
+  ID3D11Buffer* cnt = nullptr;
+  ID3D11UnorderedAccessView* cntUav = nullptr;
+  ID3D11Buffer* cntRead[3] = {};
+  bool cntPending[3] = {};
+  unsigned cntNext = 0;
+  uint32_t probeArea = 0;              // pixels in the probe of the last HUD image
+  float coverage = 0.0f;               // last read-back covered fraction of the probe
+  bool coverageFresh = false;          // a new read-back arrived since the cards last looked
+  ULONGLONG wideUntil = 0;             // full-width banner layout held until this tick
+  unsigned wideFramesInWindow = 0, wideStartsInWindow = 0;
+  bool wideShown = false;
 
   void ReleasePerGen() {
     SafeRelease(out);
@@ -504,7 +529,36 @@ bool EnsureHudShader(ID3D11Device* dev) {
   if (FAILED(hr)) { Log("hud CreateComputeShader failed: 0x%08lx", hr); return false; }
   D3D11_BUFFER_DESC bd{sizeof(HudParams), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
   if (FAILED(dev->CreateBuffer(&bd, nullptr, &g_hud.cb))) { Log("hud constant buffer failed"); return false; }
+  D3D11_BUFFER_DESC nd{4, D3D11_USAGE_DEFAULT, D3D11_BIND_UNORDERED_ACCESS, 0, 0, 0};
+  D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+  ud.Format = DXGI_FORMAT_R32_UINT;
+  ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+  ud.Buffer.NumElements = 1;
+  D3D11_BUFFER_DESC rd{4, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, 0, 0};
+  bool ok = SUCCEEDED(dev->CreateBuffer(&nd, nullptr, &g_hud.cnt)) &&
+            SUCCEEDED(dev->CreateUnorderedAccessView(g_hud.cnt, &ud, &g_hud.cntUav));
+  for (ID3D11Buffer*& b : g_hud.cntRead) ok = ok && SUCCEEDED(dev->CreateBuffer(&rd, nullptr, &b));
+  if (!ok) { Log("hud banner counter failed"); return false; }
   return true;
+}
+
+// [hud] cardN_wide: read the oldest pending probe count if the GPU is done with it (never waits), then queue
+// this frame's. Called right after the HUD image was made.
+void ReadBannerProbe(ID3D11DeviceContext* ctx) {
+  const unsigned oldest = (g_hud.cntNext + 1) % 3;
+  if (g_hud.cntPending[oldest]) {
+    D3D11_MAPPED_SUBRESOURCE map{};
+    if (SUCCEEDED(ctx->Map(g_hud.cntRead[oldest], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map))) {
+      const uint32_t n = *static_cast<const uint32_t*>(map.pData);
+      ctx->Unmap(g_hud.cntRead[oldest], 0);
+      g_hud.cntPending[oldest] = false;
+      g_hud.coverage = g_hud.probeArea ? static_cast<float>(n) / static_cast<float>(g_hud.probeArea) : 0.0f;
+      g_hud.coverageFresh = true;
+    }
+  }
+  ctx->CopyResource(g_hud.cntRead[g_hud.cntNext], g_hud.cnt);
+  g_hud.cntPending[g_hud.cntNext] = true;
+  g_hud.cntNext = (g_hud.cntNext + 1) % 3;
 }
 
 // Called with g_shared.m held (reads g_shared.tex / hudTex).
@@ -539,19 +593,30 @@ bool EnsureHudResources(ID3D11Device* dev, uint64_t gen, uint32_t w, uint32_t h,
 
 // Called with g_shared.m held, right after a new immersive frame with hudValid arrived.
 void MakeHud(ID3D11DeviceContext* ctx) {
-  const HudParams p{g_hud.w, g_hud.h, 0.02f, 0.08f, g_shared.hudAlpha.load() ? 1u : 0u, {}};
+  HudParams p{g_hud.w, g_hud.h, 0.02f, 0.08f, g_shared.hudAlpha.load() ? 1u : 0u, {}, {}};
+  const float* pf = g_hud.probeFrac;
+  p.probe[0] = static_cast<uint32_t>(pf[0] * g_hud.w);
+  p.probe[1] = static_cast<uint32_t>(pf[1] * g_hud.h);
+  p.probe[2] = static_cast<uint32_t>(pf[2] * g_hud.w);
+  p.probe[3] = static_cast<uint32_t>(pf[3] * g_hud.h);
+  g_hud.probeArea = p.probe[2] > p.probe[0] && p.probe[3] > p.probe[1]
+                        ? (p.probe[2] - p.probe[0]) * (p.probe[3] - p.probe[1]) : 0;
   ctx->UpdateSubresource(g_hud.cb, 0, nullptr, &p, 0, 0);
+  const UINT zero[4] = {};
+  ctx->ClearUnorderedAccessViewUint(g_hud.cntUav, zero);
   ID3D11ShaderResourceView* srvs[2] = {g_hud.finalSrv, g_hud.worldSrv};
+  ID3D11UnorderedAccessView* uavs[2] = {g_hud.uav, g_hud.cntUav};
   ctx->CSSetShader(g_hud.cs, nullptr, 0);
   ctx->CSSetConstantBuffers(0, 1, &g_hud.cb);
   ctx->CSSetShaderResources(0, 2, srvs);
-  ctx->CSSetUnorderedAccessViews(0, 1, &g_hud.uav, nullptr);
+  ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
   ctx->Dispatch((g_hud.w + 7) / 8, (g_hud.h + 7) / 8, 1);
   ID3D11ShaderResourceView* noSrv[2] = {};
-  ID3D11UnorderedAccessView* noUav = nullptr;
+  ID3D11UnorderedAccessView* noUav[2] = {};
   ctx->CSSetShaderResources(0, 2, noSrv);
-  ctx->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+  ctx->CSSetUnorderedAccessViews(0, 2, noUav, nullptr);
   ctx->CSSetShader(nullptr, nullptr, 0);
+  if (g_hud.probeArea) ReadBannerProbe(ctx);
   g_hud.have = true;
   g_hud.updates++;
   g_hud.updatesInWindow++;
@@ -891,6 +956,17 @@ void RunInstance(const Config& cfg) {
     g_shared.hudConfigured.store(false);
   }
   if (hudMode) Log("hud: %d card(s); Ctrl+Shift+F9 toggles", cfg.hudCardCount);
+  // [hud] cardN_wide: watch the wide rect's part left of the card's own - nothing else is drawn there.
+  int bannerCard = -1;
+  for (int c = 0; c < cfg.hudCardCount && bannerCard < 0; ++c)
+    if (cfg.hudCards[c].wide) bannerCard = c;
+  if (bannerCard >= 0) {
+    const Config::HudCard& b = cfg.hudCards[bannerCard];
+    const float pf[4] = {b.wx0, b.wy0, b.x0, b.wy1};
+    memcpy(g_hud.probeFrac, cfg.haveBannerProbe ? cfg.bannerProbe : pf, sizeof(pf));
+  } else {
+    memset(g_hud.probeFrac, 0, sizeof(g_hud.probeFrac));
+  }
   const bool scaleMode = cfg.eyeResolution > 0.0f && recW && sharedFmt == DXGI_FORMAT_R8G8B8A8_UNORM &&
                          EnsureScaleShader(dev);
   g_shared.sharedFormat.store(sharedFmt);
@@ -1244,11 +1320,34 @@ void RunInstance(const Config& cfg) {
               float home[3];
               CamHome(home);
               const float hw = static_cast<float>(hudSc.w), hh = static_cast<float>(hudSc.h);
+              // [hud] cardN_wide: a full-width banner (Zwift drawing over most of the probe) switches that card to
+              // its wide part; held 0.4 s past the last sighting so the banner's own animation doesn't flicker it.
+              const ULONGLONG tick = GetTickCount64();
+              if (bannerCard >= 0 && g_hud.coverageFresh && g_hud.coverage >= 0.4f) g_hud.wideUntil = tick + 400;
+              g_hud.coverageFresh = false;  // an old reading never holds the wide layout (HUD paused, menus)
+              const bool wide = bannerCard >= 0 && tick < g_hud.wideUntil;
+              if (wide && !g_hud.wideShown) g_hud.wideStartsInWindow++;
+              g_hud.wideShown = wide;
+              if (wide) g_hud.wideFramesInWindow++;
               for (int c = 0; c < cfg.hudCardCount; ++c) {
                 const Config::HudCard& k = cfg.hudCards[c];
-                const int32_t x0 = static_cast<int32_t>(k.x0 * hw), y0 = static_cast<int32_t>(k.y0 * hh);
-                const int32_t rw = std::max(1, static_cast<int32_t>(k.x1 * hw) - x0);
-                const int32_t rh = std::max(1, static_cast<int32_t>(k.y1 * hh) - y0);
+                float r[4] = {k.x0, k.y0, k.x1, k.y1};  // the part of the window shown this frame
+                if (wide) {
+                  const Config::HudCard& b = cfg.hudCards[bannerCard];
+                  if (c == bannerCard) {
+                    r[0] = b.wx0, r[1] = b.wy0, r[2] = b.wx1, r[3] = b.wy1;
+                  } else if (r[0] < b.wx1 && r[2] > b.wx0 && r[1] < b.wy1 && r[3] > b.wy0) {
+                    if (r[1] >= b.wy0) continue;  // wholly under the banner: hidden while it shows
+                    r[3] = b.wy0;                 // else cut off above it, so nothing shows twice
+                  }
+                }
+                // Metres per HUD pixel from the card's own part, so a wider or cut-off part keeps the same scale
+                // and every pixel stays where it was; the pose moves by the change of the part's centre.
+                const float kw = std::max(1.0f, (k.x1 - k.x0) * hw);
+                const float mpp = k.width / kw;
+                const int32_t x0 = static_cast<int32_t>(r[0] * hw), y0 = static_cast<int32_t>(r[1] * hh);
+                const int32_t rw = std::max(1, static_cast<int32_t>(r[2] * hw) - x0);
+                const int32_t rh = std::max(1, static_cast<int32_t>(r[3] * hh) - y0);
                 XrCompositionLayerQuad& q = cardQuads[c];
                 q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
                 q.layerFlags =
@@ -1258,7 +1357,19 @@ void RunInstance(const Config& cfg) {
                 q.subImage.swapchain = hudSc.handle;
                 q.subImage.imageRect = {{x0, y0}, {rw, rh}};
                 q.pose = CardPose(home, k, g_hudSpread);
-                q.size = {k.width, k.width * static_cast<float>(rh) / static_cast<float>(rw)};
+                const float dx = ((r[0] + r[2]) - (k.x0 + k.x1)) * 0.5f * hw * mpp;   // card's right
+                const float dy = -((r[1] + r[3]) - (k.y0 + k.y1)) * 0.5f * hh * mpp;  // card's up (window y is down)
+                if (dx != 0.0f || dy != 0.0f) {
+                  const XrQuaternionf& o = q.pose.orientation;
+                  const float v[3] = {dx, dy, 0.0f};
+                  // rotate v by o: v + 2 * cross(o.xyz, cross(o.xyz, v) + o.w * v)
+                  const float t[3] = {o.y * v[2] - o.z * v[1] + o.w * v[0], o.z * v[0] - o.x * v[2] + o.w * v[1],
+                                      o.x * v[1] - o.y * v[0] + o.w * v[2]};
+                  q.pose.position.x += v[0] + 2.0f * (o.y * t[2] - o.z * t[1]);
+                  q.pose.position.y += v[1] + 2.0f * (o.z * t[0] - o.x * t[2]);
+                  q.pose.position.z += v[2] + 2.0f * (o.x * t[1] - o.y * t[0]);
+                }
+                q.size = {static_cast<float>(rw) * mpp, static_cast<float>(rh) * mpp};
                 layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&q);
               }
             }
@@ -1303,6 +1414,10 @@ void RunInstance(const Config& cfg) {
       if (hudMode && (g_hud.updatesInWindow || g_hud.have))
         Log("  hud: %u new HUD images, %d card(s) %s", g_hud.updatesInWindow, cfg.hudCardCount,
             g_hud.have && hudSc.released ? "shown" : "not shown yet");
+      if (hudMode && bannerCard >= 0 && (g_hud.wideFramesInWindow || g_hud.wideStartsInWindow))
+        Log("  hud: full-width banner %u time(s), card%d wide for %u frames (probe coverage now %.0f%%)",
+            g_hud.wideStartsInWindow, bannerCard + 1, g_hud.wideFramesInWindow, g_hud.coverage * 100.0f);
+      g_hud.wideFramesInWindow = g_hud.wideStartsInWindow = 0;
       g_hud.updatesInWindow = 0;
       if (g_scale.scaledInWindow)
         Log("  eye_resolution: %u eye images filtered %ux%u -> %ux%u", g_scale.scaledInWindow, sc.srcW, sc.srcH, sc.w,

@@ -1,3 +1,6 @@
+# zvr_loader.exe now does this by itself ([setup] vr_graphics in zwift_vr.ini; "Restore Zwift graphics.cmd" undoes
+# it). This script is kept for doing it by hand, e.g. without the loader. Same files, same backup names.
+#
 # Replace Zwift's graphics profiles (ultra/high/medium/basic) with the VR profile (config\zwift-vr-graphics.txt),
 # or restore Zwift's originals. Run from an ADMIN PowerShell (Zwift is installed under Program Files). Close Zwift first.
 #
